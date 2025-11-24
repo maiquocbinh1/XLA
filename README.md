@@ -1,6 +1,6 @@
-# Low-Light Image Enhancement via Structure Modeling and Guidance
+# XLA
 
-This is a pytorch project for the paper **Low-Light Image Enhancement via Structure Modeling and Guidance** by Xiaogang Xu, Ruixing Wang, and Jiangbo Lu presented at **CVPR2023**.
+This repository hosts the PyTorch implementation of **Low-Light Image Enhancement via Structure Modeling and Guidance** by Xiaogang Xu, Ruixing Wang, and Jiangbo Lu presented at **CVPR2023**.
 
 
 ## Introduction
