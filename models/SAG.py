@@ -975,9 +975,11 @@ class FullGenerator(nn.Module):
             conv = [ConvLayer(in_channel, out_channel, 3, downsample=True, device=device),
                     nn.InstanceNorm2d(out_channel)]
             setattr(self, self.names[self.log_size - i + 1], nn.Sequential(*conv))
+            # === FIX: Đặt use_checkpoint=False tại đây ===
             conv2 = [Encoder_block(in_channel, out_channel, img_size=2 ** (i - 1), kernel_size=3,
                                    downsample=True, device=device,
-                                   depth=depths[count], num_head=num_heads[count], win_size=win_sizes[count]),
+                                   depth=depths[count], num_head=num_heads[count], win_size=win_sizes[count],
+                                   use_checkpoint=False), # <-- TẮT CHECKPOINT
                      nn.InstanceNorm2d(out_channel)]
             setattr(self, self.names2[self.log_size - i + 1], nn.Sequential(*conv2))
             in_channel = out_channel

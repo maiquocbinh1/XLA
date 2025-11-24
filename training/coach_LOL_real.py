@@ -3,13 +3,15 @@ import random
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-
+import gc
 
 import torch
 from torch import nn, autograd
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
+# Import AMP cho Mixed Precision Training
+from torch.cuda.amp import autocast, GradScaler
 
 from utils import common, train_utils
 from configs import data_configs
@@ -22,18 +24,13 @@ from models.AM import GlobalGenerator3 as GlobalGenerator1
 from models.SAG import Discriminator, FullGenerator
 from training.ranger import Ranger
 
-import torch.distributed as dist
 import math
 import numpy as np
 import cv2
 
 def data_sampler(dataset, shuffle, distributed):
-    if distributed:
-        return torch.utils.data.distributed.DistributedSampler(dataset, shuffle=shuffle)
-
     if shuffle:
         return torch.utils.data.RandomSampler(dataset)
-
     else:
         return torch.utils.SequentialSampler(dataset)
 
@@ -47,46 +44,34 @@ def requires_grad(model, flag=True):
         p.requires_grad = flag
 
 def calculate_psnr(img1, img2):
-    img1 = img1.astype(np.float64)
-    img2 = img2.astype(np.float64)
+    img1 = img1.astype(np.float32)
+    img2 = img2.astype(np.float32)
     mse = np.mean((img1 - img2)**2)
     if mse == 0:
         return float('inf')
     return 20 * math.log10(255.0 / math.sqrt(mse))
 
 def get_world_size():
-    if not dist.is_available():
-        return 1
-
-    if not dist.is_initialized():
-        return 1
-
-    return dist.get_world_size()
-
+    return 1
 
 def reduce_sum(tensor):
-    if not dist.is_available():
-        return tensor
-
-    if not dist.is_initialized():
-        return tensor
-
-    tensor = tensor.clone()
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-
     return tensor
 
-
 def cross_entropy_loss_RCF(prediction, labelf, beta):
-    label = labelf.long()
-    mask = labelf.clone()
-    num_positive = torch.sum(label==1).float()
-    num_negative = torch.sum(label==0).float()
+    # --- FIX: Ép kiểu về float32 và tắt autocast cho đoạn này ---
+    prediction = prediction.float()
+    labelf = labelf.float()
+    
+    with autocast(enabled=False):
+        label = labelf.long()
+        mask = labelf.clone()
+        num_positive = torch.sum(label==1).float()
+        num_negative = torch.sum(label==0).float()
 
-    mask[label == 1] = 1.0 * num_negative / (num_positive + num_negative)
-    mask[label == 0] = beta * num_positive / (num_positive + num_negative)
-    mask[label == 2] = 0
-    cost = F.binary_cross_entropy(prediction, labelf, weight=mask, reduction='mean')
+        mask[label == 1] = 1.0 * num_negative / (num_positive + num_negative)
+        mask[label == 0] = beta * num_positive / (num_positive + num_negative)
+        mask[label == 2] = 0
+        cost = F.binary_cross_entropy(prediction, labelf, weight=mask, reduction='mean')
     return cost
 
 #######################################################
@@ -127,7 +112,6 @@ class Measure():
     def ssim(self, imgA, imgB, gray_scale=True):
         if gray_scale:
             score, diff = ssim_o(cv2.cvtColor(imgA, cv2.COLOR_RGB2GRAY), cv2.cvtColor(imgB, cv2.COLOR_RGB2GRAY), full=True, multichannel=True)
-        # multichannel: If True, treat the last dimension of the array as channels. Similarity calculations are done independently for each channel then averaged.
         else:
             score, diff = ssim_o(imgA, imgB, full=True, multichannel=True)
         return score
@@ -143,66 +127,34 @@ class Coach:
 
         self.global_step = 0
         self.device = 'cuda'
-        self.rank = torch.distributed.get_rank()
+        self.rank = 0
         self.opts.device = self.device
-        self.net = FullGenerator(512, 512, 8,
-                                 channel_multiplier=2, narrow=1.0, device='cuda').to(self.device)
+        
+        self.scaler = GradScaler()
 
-        # Initialize loss
+        self.net = FullGenerator(self.opts.stylegan_size, 512, 8,
+                                 channel_multiplier=2, narrow=0.25, device=self.device).to(self.device)
+
         if self.opts.lpips_lambda > 0:
             self.lpips_loss = LPIPS1(net_type=self.opts.lpips_type).to(self.device).eval()
 
         self.mse_loss = nn.MSELoss().to(self.device).eval()
-        self.refinement = GlobalGenerator1(3, 3, 32, 2, 1).to(self.device) ## appearance modeling
-        self.refinement2 = GlobalGenerator3(3+3, 3, 16, 1).to(self.device) ## structure-guided enhancement
+        self.refinement = GlobalGenerator1(3, 3, 32, 2, 1).to(self.device) 
+        self.refinement2 = GlobalGenerator3(3+3, 3, 16, 1).to(self.device) 
 
-        # Initialize optimizer
         self.optimizer = self.configure_optimizers()
 
-        self.net = nn.parallel.DistributedDataParallel(
-            self.net,
-            device_ids=[self.opts.local_rank],
-            output_device=self.opts.local_rank,
-            broadcast_buffers=False,find_unused_parameters=True
-        )
-
-        self.refinement = nn.parallel.DistributedDataParallel(
-            self.refinement,
-            device_ids=[self.opts.local_rank],
-            output_device=self.opts.local_rank,
-            broadcast_buffers=False, find_unused_parameters=True
-        )
-
-        self.refinement2 = nn.parallel.DistributedDataParallel(
-            self.refinement2,
-            device_ids=[self.opts.local_rank],
-            output_device=self.opts.local_rank,
-            broadcast_buffers=False, find_unused_parameters=True
-        )
-
-        # Initialize discriminator
         if self.opts.w_discriminator_lambda > 0:
-            self.discriminator_style = Discriminator(size=512, channel_multiplier=2,
-                                                     narrow=1.0, device='cuda').to(self.device)
+            self.discriminator_style = Discriminator(size=self.opts.stylegan_size, channel_multiplier=2,
+                                                     narrow=0.25, device=self.device).to(self.device)
             self.discriminator_style_optimizer = torch.optim.Adam(list(self.discriminator_style.parameters()),
                                                                   lr=opts.w_discriminator_lr)
 
-            self.discriminator_style = nn.parallel.DistributedDataParallel(
-                self.discriminator_style,
-                device_ids=[self.opts.local_rank],
-                output_device=self.opts.local_rank,
-                broadcast_buffers=False,find_unused_parameters=True
-            )
-
-        # Initialize dataset
         self.train_dataset, self.test_dataset = self.configure_datasets()
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
-        dataset_ratio = 1
 
         self.train_dataloader = DataLoader(self.train_dataset,
                                            batch_size=self.opts.batch_size,
-                                           sampler=data_sampler(self.train_dataset, shuffle=True, distributed=True),
+                                           sampler=data_sampler(self.train_dataset, shuffle=True, distributed=False),
                                            num_workers=int(self.opts.workers),
                                            drop_last=True)
         self.test_dataloader = DataLoader(self.test_dataset,
@@ -211,12 +163,10 @@ class Coach:
                                           drop_last=True)
         self.train_dataloader = sample_data(self.train_dataloader)
 
-        # Initialize logger
         log_dir = os.path.join(opts.exp_dir, 'logs')
         os.makedirs(log_dir, exist_ok=True)
         self.logger = SummaryWriter(log_dir=log_dir)
 
-        # Initialize checkpoint dir
         self.checkpoint_dir = os.path.join(opts.exp_dir, 'checkpoints')
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.best_val_loss = None
@@ -236,15 +186,19 @@ class Coach:
 
         self.global_step = ckpt['global_step'] + 1
         self.best_val_loss = ckpt['best_val_loss']
-        self.net.module.load_state_dict(ckpt['state_dict'])
-        self.refinement.module.load_state_dict(ckpt['state_dict_refine'])
-        self.refinement2.module.load_state_dict(ckpt['state_dict_refine2'])
+        self.net.load_state_dict(ckpt['state_dict'])
+        self.refinement.load_state_dict(ckpt['state_dict_refine'])
+        self.refinement2.load_state_dict(ckpt['state_dict_refine2'])
 
         if self.opts.keep_optimizer:
             self.optimizer.load_state_dict(ckpt['optimizer'])
         if self.opts.w_discriminator_lambda > 0:
-            self.discriminator_style.module.load_state_dict(ckpt['discriminator_style_state_dict'])
+            self.discriminator_style.load_state_dict(ckpt['discriminator_style_state_dict'])
             self.discriminator_style_optimizer.load_state_dict(ckpt['discriminator_style_optimizer_state_dict'])
+        
+        if 'scaler' in ckpt:
+            self.scaler.load_state_dict(ckpt['scaler'])
+
         del ckpt
         torch.cuda.empty_cache()
 
@@ -259,31 +213,40 @@ class Coach:
                 loss_dict = {}
 
                 if self.is_training_discriminator():
+                    torch.cuda.empty_cache()
                     loss_dict2 = self.train_discriminator_img(batch)
                     loss_dict = {**loss_dict2}
 
-                x, y, y_hat, latent, y_hat_inter, y_hat_sketch, sketch = self.forward(batch)
-                loss, encoder_loss_dict, id_logs = self.calc_loss(x, y, y_hat, latent, y_hat_inter, y_hat_sketch, sketch)
-                loss_dict = {**loss_dict, **encoder_loss_dict}
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                
+                with autocast():
+                    x, y, y_hat, latent, y_hat_inter, y_hat_sketch, sketch = self.forward(batch)
+                    loss, encoder_loss_dict, id_logs = self.calc_loss(x, y, y_hat, latent, y_hat_inter, y_hat_sketch, sketch)
+                
+                loss_dict = {**loss_dict, **encoder_loss_dict}
+                
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
-                # Logging related
                 if self.global_step % self.opts.image_interval == 0 or (self.global_step < 1000 and self.global_step % 25 == 0):
-                    o1 = torch.cat([x, y], dim=2)*2-1
-                    y_hat_inter_save = y_hat_inter
-                    y_hat_inter_save2 = y_hat_sketch.repeat(1, 3, 1, 1)
-                    o2 = torch.cat([y_hat_inter_save, y_hat_inter_save2], dim=2)*2-1
-                    o3 = torch.cat([y_hat, sketch.repeat(1, 3, 1, 1)], dim=2)*2-1
-                    self.parse_and_log_images(id_logs, o1, o2, o3, title='images/train/faces')
+                    with torch.no_grad():
+                        o1 = torch.cat([x, y], dim=2)*2-1
+                        y_hat_inter_save = y_hat_inter
+                        y_hat_inter_save2 = y_hat_sketch.repeat(1, 3, 1, 1)
+                        o2 = torch.cat([y_hat_inter_save, y_hat_inter_save2], dim=2)*2-1
+                        o3 = torch.cat([y_hat, sketch.repeat(1, 3, 1, 1)], dim=2)*2-1
+                        self.parse_and_log_images(id_logs, o1, o2, o3, title='images/train/faces')
+                
                 if self.global_step % self.opts.board_interval == 0:
                     self.print_metrics(loss_dict, prefix='train')
                     self.log_metrics(loss_dict, prefix='train')
 
-                # Validation related
                 val_loss_dict = None
                 if self.global_step % self.opts.val_interval == 0 or self.global_step == self.opts.max_steps:
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    
                     val_loss_dict = self.validate()
                     if val_loss_dict and (self.best_val_loss is None or val_loss_dict['loss'] < self.best_val_loss):
                         self.best_val_loss = val_loss_dict['loss']
@@ -311,14 +274,20 @@ class Coach:
         psnr_all = 0
         psnr_all2 = 0
         psnr_count = 0
+        
         for batch_idx, batch in enumerate(self.test_dataloader):
             cur_loss_dict = {}
-            if self.is_training_discriminator():
-                cur_loss_dict = self.validate_discriminator(batch)
+            
             with torch.no_grad():
-                x, y, y_hat_all, latent, y_hat_inter, y_hat_sketch, sketch = self.forward(batch)
-                loss, cur_encoder_loss_dict, id_logs = self.calc_loss(x, y, y_hat_all, latent, y_hat_inter, y_hat_sketch, sketch)
+                if self.is_training_discriminator():
+                    cur_loss_dict = self.validate_discriminator(batch)
+                
+                with autocast():
+                    x, y, y_hat_all, latent, y_hat_inter, y_hat_sketch, sketch = self.forward(batch)
+                    loss, cur_encoder_loss_dict, id_logs = self.calc_loss(x, y, y_hat_all, latent, y_hat_inter, y_hat_sketch, sketch)
+                
                 cur_loss_dict = {**cur_loss_dict, **cur_encoder_loss_dict}
+            
             agg_loss_dict.append(cur_loss_dict)
 
             y_hat = y_hat_all
@@ -346,21 +315,24 @@ class Coach:
                 psnr_all2+=psnr_this2
                 psnr_count += 1
 
-            o1 = torch.cat([x, y], dim=2)*2-1 ## input and GT
-            y_hat_inter_save = y_hat_inter
-            y_hat_inter_save2 = y_hat_sketch.repeat(1, 3, 1, 1)
-            o2 = torch.cat([y_hat_inter_save, y_hat_inter_save2], dim=2)*2-1 ## I_a and I_S
-            o3 = torch.cat([y_hat, sketch.repeat(1, 3, 1, 1)], dim=2)*2-1 ## output I_hat and GT for edge
+            if batch_idx % 50 == 0:
+                o1 = torch.cat([x, y], dim=2)*2-1
+                y_hat_inter_save = y_hat_inter
+                y_hat_inter_save2 = y_hat_sketch.repeat(1, 3, 1, 1)
+                o2 = torch.cat([y_hat_inter_save, y_hat_inter_save2], dim=2)*2-1
+                o3 = torch.cat([y_hat, sketch.repeat(1, 3, 1, 1)], dim=2)*2-1
 
-            self.parse_and_log_images(id_logs, o1, o2, o3,
-                                      title='images/test/faces',
-                                      subscript='{:04d}'.format(batch_idx))
+                self.parse_and_log_images(id_logs, o1, o2, o3,
+                                          title='images/test/faces',
+                                          subscript='{:04d}'.format(batch_idx))
 
             if self.global_step == 0 and batch_idx >= 4:
                 self.net.train()
                 self.refinement.train()
                 self.refinement2.train()
-                return None  # Do not log, inaccurate in first batch
+                return None
+            
+            gc.collect()
 
         psnr_average = psnr_all*1.0/psnr_count
         psnr_average2 = psnr_all2*1.0/psnr_count
@@ -483,6 +455,8 @@ class Coach:
     def checkpoint_me(self, loss_dict, is_best):
         save_name = 'best_model.pt' if is_best else 'iteration_{}.pt'.format(self.global_step)
         save_dict = self.__get_save_dict()
+        save_dict['scaler'] = self.scaler.state_dict()
+        
         checkpoint_path = os.path.join(self.checkpoint_dir, save_name)
         torch.save(save_dict, checkpoint_path)
         with open(os.path.join(self.checkpoint_dir, 'timestamp.txt'), 'a') as f:
@@ -529,8 +503,9 @@ class Coach:
         id_logs = None
 
         if self.is_training_discriminator():
-            fake_pred = self.discriminator_style(y_hat_sketch)
-            loss_disc_img = F.softplus(-fake_pred).mean()
+            with autocast():
+                fake_pred = self.discriminator_style(y_hat_sketch)
+                loss_disc_img = F.softplus(-fake_pred).mean()
             loss_dict['encoder_discriminator_img_loss'] = float(loss_disc_img)
             loss += self.opts.w_discriminator_lambda * loss_disc_img
 
@@ -582,7 +557,9 @@ class Coach:
             x, y = x.to(self.device).float(), y.to(self.device).float()
             sketch = sketch.to(self.device).float()
             x_gray = x[:, 0:1, :, :] * 0.299 + x[:, 1:2, :, :] * 0.587 + x[:, 2:3, :, :] * 0.114
-            y_hat_sketch, latent = self.net(x_gray, return_latents=True)
+            
+            with autocast():
+                y_hat_sketch, latent = self.net(x_gray, return_latents=True)
         return sketch, y_hat_sketch
 
     def log_metrics(self, metrics_dict, prefix):
@@ -628,23 +605,19 @@ class Coach:
 
     def __get_save_dict(self):
         save_dict = {
-            'state_dict': self.net.module.state_dict(),
-            'state_dict_refine': self.refinement.module.state_dict(),
-            'state_dict_refine2': self.refinement2.module.state_dict(),
+            'state_dict': self.net.state_dict(),
+            'state_dict_refine': self.refinement.state_dict(),
+            'state_dict_refine2': self.refinement2.state_dict(),
             'opts': vars(self.opts)
         }
-        # save the latent avg in state_dict for inference if truncation of w was used during training
-
-        if self.opts.save_training_data:  # Save necessary information to enable training continuation from checkpoint
+        if self.opts.save_training_data:
             save_dict['global_step'] = self.global_step
             save_dict['optimizer'] = self.optimizer.state_dict()
             save_dict['best_val_loss'] = self.best_val_loss
             if self.opts.w_discriminator_lambda > 0:
-                save_dict['discriminator_style_state_dict'] = self.discriminator_style.module.state_dict()
+                save_dict['discriminator_style_state_dict'] = self.discriminator_style.state_dict()
                 save_dict['discriminator_style_optimizer_state_dict'] = self.discriminator_style_optimizer.state_dict()
         return save_dict
-
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Discriminator ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
 
     def is_training_discriminator(self):
         return self.opts.w_discriminator_lambda > 0
@@ -675,42 +648,49 @@ class Coach:
 
         y, y_hat = self.forward_no_latent2(batch)
 
-        real_pred = self.discriminator_style(y)
-        fake_pred = self.discriminator_style(y_hat)
-        loss = self.discriminator_img_loss(real_pred, fake_pred, loss_dict)
-        loss_dict['discriminator_img_loss'] = float(loss)
-
         self.discriminator_style_optimizer.zero_grad()
-        loss.backward()
-        self.discriminator_style_optimizer.step()
+        
+        with autocast():
+            real_pred = self.discriminator_style(y)
+            fake_pred = self.discriminator_style(y_hat)
+            loss = self.discriminator_img_loss(real_pred, fake_pred, loss_dict)
+            loss_dict['discriminator_img_loss'] = float(loss)
 
-        # r1 regularization
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.discriminator_style_optimizer)
+        self.scaler.update()
+
         d_regularize = self.global_step % self.opts.d_reg_every == 0
         if d_regularize:
             real_w = y.detach()
             real_w.requires_grad = True
-            real_pred = self.discriminator_style(real_w)
-            r1_loss = self.discriminator_r1_loss(real_pred, real_w)
-
+            
             self.discriminator_style.zero_grad()
-            r1_final_loss = self.opts.r1 / 2 * r1_loss * self.opts.d_reg_every + 0 * real_pred[0].mean()
-            r1_final_loss.backward()
-            self.discriminator_style_optimizer.step()
+            
+            with autocast():
+                real_pred = self.discriminator_style(real_w)
+                r1_loss = self.discriminator_r1_loss(real_pred, real_w)
+                r1_final_loss = self.opts.r1 / 2 * r1_loss * self.opts.d_reg_every + 0 * real_pred[0].mean()
+            
+            self.scaler.scale(r1_final_loss).backward()
+            self.scaler.step(self.discriminator_style_optimizer)
+            self.scaler.update()
+            
             loss_dict['discriminator_img_r1_loss'] = float(r1_final_loss)
 
-        # Reset to previous state
         self.requires_grad(self.discriminator_style, False)
 
         return loss_dict
-
 
     def validate_discriminator(self, test_batch):
         with torch.no_grad():
             loss_dict = {}
             y, y_hat = self.forward_no_latent2(test_batch)
-
-            real_pred = self.discriminator_style(y)
-            fake_pred = self.discriminator_style(y_hat)
-            loss = self.discriminator_img_loss(real_pred, fake_pred, loss_dict)
+            
+            with autocast():
+                real_pred = self.discriminator_style(y)
+                fake_pred = self.discriminator_style(y_hat)
+                loss = self.discriminator_img_loss(real_pred, fake_pred, loss_dict)
+            
             loss_dict['discriminator_loss'] = float(loss)
             return loss_dict

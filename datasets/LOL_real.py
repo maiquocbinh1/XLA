@@ -38,11 +38,11 @@ class ImagesDataset2(Dataset):
 		self.source_transform = source_transform
 		self.target_transform = target_transform
 		if train:
-			source_root = '/mnt/proj73/xgxu/LOL/LOL-v2/Real_captured/Train/Low'
-			target_root = '/mnt/proj73/xgxu/LOL/LOL-v2/Real_captured/Train/Normal'
+			source_root = r'C:\Users\BINH\Desktop\XLA\CVPR-2020-Semi-Low-Light-Dataset\stage2-LOL\Our_low'
+			target_root = r'C:\Users\BINH\Desktop\XLA\CVPR-2020-Semi-Low-Light-Dataset\stage2-LOL\Our_normal'
 		else:
-			source_root = '/mnt/proj73/xgxu/LOL/LOL-v2/Real_captured/Test/Low'
-			target_root = '/mnt/proj73/xgxu/LOL/LOL-v2/Real_captured/Test/Normal'
+			source_root = r'C:\Users\BINH\Desktop\XLA\CVPR-2020-Semi-Low-Light-Dataset\stage2-LOL\Our_low'
+			target_root = r'C:\Users\BINH\Desktop\XLA\CVPR-2020-Semi-Low-Light-Dataset\stage2-LOL\Our_normal'
 		source_root = os.path.join(source_root_pre, source_root)
 		target_root = os.path.join(target_root_pre, target_root)
 

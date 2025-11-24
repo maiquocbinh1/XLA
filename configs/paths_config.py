@@ -1,8 +1,8 @@
 dataset_paths = {
-	'ours_train_lq': '',
-	'ours_train_hq': '',
-	'ours_test_lq': '',
-	'ours_test_hq': '',
+	'ours_train_lq': r'C:\Users\BINH\Desktop\XLA\CVPR-2020-Semi-Low-Light-Dataset\stage2-LOL\Our_low',
+	'ours_train_hq': r'C:\Users\BINH\Desktop\XLA\CVPR-2020-Semi-Low-Light-Dataset\stage2-LOL\Our_high',
+	'ours_test_lq': r'C:\Users\BINH\Desktop\XLA\CVPR-2020-Semi-Low-Light-Dataset\stage2-LOL\Our_low_test',
+	'ours_test_hq': r'C:\Users\BINH\Desktop\XLA\CVPR-2020-Semi-Low-Light-Dataset\stage2-LOL\Our_high_test',
 }
 
 model_paths = {
